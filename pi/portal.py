@@ -119,24 +119,46 @@ _gpio_directions = {}   # pin -> "output" | "input"
 GPIO_ALLOWED = {16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}  # BCM GPIOs safe for DUT control
 # Reserved: GPIO 2/3 = I2C (Si5351), GPIO 5/6 = GPCLK, GPIO 6/12/13 = PE4302 LE/CLK/DATA
 
+# Dashboard panel switches: a bench without the hardware can turn the
+# signal generator / SDR off entirely (see dashboard_panels.py).
+import dashboard_panels
+
 # Unified signal generator (Si5351 / PE4302 with GPCLK fallback)
-try:
-    from signal_generator import SignalGenerator
-    _siggen: "SignalGenerator | None" = SignalGenerator()
-    print(f"[siggen] hardware: {_siggen.hardware_status()}, "
-          f"backends: {_siggen.available_backends()}", flush=True)
-except Exception as _siggen_exc:  # pragma: no cover
-    print(f"[siggen] disabled: {_siggen_exc}", flush=True)
-    _siggen = None
+_siggen = None
+
+
+def _init_siggen():
+    global _siggen
+    try:
+        from signal_generator import SignalGenerator
+        _siggen = SignalGenerator()
+        print(f"[siggen] hardware: {_siggen.hardware_status()}, "
+              f"backends: {_siggen.available_backends()}", flush=True)
+    except Exception as _siggen_exc:  # pragma: no cover
+        print(f"[siggen] disabled: {_siggen_exc}", flush=True)
+        _siggen = None
+
 
 # RTL-SDR receiver (rtl_433 decode + pulse analyzer) — receive-side of siggen
-try:
-    from sdr_controller import SdrReceiver
-    _sdr: "SdrReceiver | None" = SdrReceiver()
-    print(f"[sdr] hardware: {_sdr.hardware_status()}", flush=True)
-except Exception as _sdr_exc:  # pragma: no cover
-    print(f"[sdr] disabled: {_sdr_exc}", flush=True)
-    _sdr = None
+_sdr = None
+
+
+def _init_sdr():
+    global _sdr
+    try:
+        from sdr_controller import SdrReceiver
+        _sdr = SdrReceiver()
+        print(f"[sdr] hardware: {_sdr.hardware_status()}", flush=True)
+    except Exception as _sdr_exc:  # pragma: no cover
+        print(f"[sdr] disabled: {_sdr_exc}", flush=True)
+        _sdr = None
+
+
+for _name, _init in (("siggen", _init_siggen), ("sdr", _init_sdr)):
+    if dashboard_panels.enabled(_name):
+        _init()
+    else:
+        print(f"[{_name}] off in {dashboard_panels.CONFIG_FILE}", flush=True)
 
 # UDP log receiver — ESP32 devices send debug logs over UDP to port 5555
 UDP_LOG_PORT = int(os.environ.get("UDP_LOG_PORT", "5555"))
@@ -2795,6 +2817,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_ble_status()
         elif path.startswith("/firmware/"):
             self._handle_firmware_download(path)
+        elif path.startswith("/panels/"):
+            dashboard_panels.proxy(self)
+        elif path == "/api/dashboard":
+            self._send_json({"ok": True, **dashboard_panels.state(
+                {"siggen": _siggen, "sdr": _sdr})})
         elif path in ("/", "/index.html"):
             self._serve_ui()
         else:
@@ -2867,6 +2894,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_debug_start()
         elif path == "/api/debug/stop":
             self._handle_debug_stop()
+        elif path.startswith("/panels/"):
+            length = int(self.headers.get("Content-Length", 0))
+            dashboard_panels.proxy(self, self.rfile.read(length))
+        elif path == "/api/dashboard/builtin":
+            self._handle_dashboard_builtin()
         elif path == "/api/siggen/start":
             self._handle_siggen_start()
         elif path == "/api/siggen/stop":
@@ -4952,6 +4984,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._sdr_unavailable()
         self._send_json({"ok": True, **_sdr.stop()})
 
+    def _handle_dashboard_builtin(self):
+        global _siggen, _sdr
+        body = self._read_json() or {}
+        name, on = body.get("id"), bool(body.get("enabled"))
+        try:
+            dashboard_panels.set_enabled(name, on)
+        except (ValueError, OSError) as exc:
+            return self._send_json({"ok": False, "error": str(exc)}, 400)
+        if name == "siggen":
+            if on and _siggen is None:
+                _init_siggen()
+            elif not on and _siggen is not None:
+                _siggen.shutdown()
+                _siggen = None
+        elif name == "sdr":
+            if on and _sdr is None:
+                _init_sdr()
+            elif not on and _sdr is not None:
+                for stop in (_sdr.stop_live, _sdr.stop_log, _sdr.stop):
+                    try:
+                        stop()
+                    except Exception:  # pragma: no cover
+                        pass
+                _sdr = None
+        log_activity(f"dashboard: {name} {'enabled' if on else 'disabled'}", "info")
+        self._send_json({"ok": True, **dashboard_panels.state(
+            {"siggen": _siggen, "sdr": _sdr})})
+
     def _serve_ui(self):
         # Substituted here rather than left to the fetch: the name is then
         # right in the tab title before any JavaScript runs, and stays right
@@ -4959,6 +5019,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # somebody has two tabs open and needs to know which board they are
         # looking at.
         html = _UI_HTML.replace("__BENCH_NAME__", hostname)
+        html = dashboard_panels.inject(html, {"siggen": _siggen, "sdr": _sdr})
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")

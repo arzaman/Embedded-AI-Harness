@@ -1,0 +1,23 @@
+{
+  "disabled": [
+    "siggen",
+    "sdr"
+  ],
+  "panels": [
+    {
+      "id": "meter",
+      "title": "Multimeter",
+      "script": ":8081/panel/meter.js"
+    },
+    {
+      "id": "logic",
+      "title": "Logic Analyzer",
+      "script": ":8081/panel/logic.js"
+    },
+    {
+      "id": "dut",
+      "title": "DUT details",
+      "script": ":8081/panel/dut.js"
+    }
+  ]
+}

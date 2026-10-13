@@ -136,6 +136,7 @@ cp "$SCRIPT_DIR/si5351.py"                  /usr/local/bin/si5351.py
 cp "$SCRIPT_DIR/pe4302.py"                  /usr/local/bin/pe4302.py
 cp "$SCRIPT_DIR/signal_generator.py"        /usr/local/bin/signal_generator.py
 cp "$SCRIPT_DIR/sdr_controller.py"          /usr/local/bin/sdr_controller.py
+cp "$SCRIPT_DIR/dashboard_panels.py"        /usr/local/bin/dashboard_panels.py
 cp "$SCRIPT_DIR/debug_controller.py"       /usr/local/bin/debug_controller.py
 cp "$SCRIPT_DIR/mqtt_controller.py"         /usr/local/bin/mqtt_controller.py
 cp "$SCRIPT_DIR/netscan_controller.py"      /usr/local/bin/netscan_controller.py
