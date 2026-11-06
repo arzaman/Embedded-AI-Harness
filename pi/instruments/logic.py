@@ -640,8 +640,12 @@ class LogicAnalyzer:
 
         chans = []
         for i, info in zip(idx, self._chan_info(idx)):
-            if labels.get(info["channel"]) or labels.get(info["probe"]):
-                info["label"] = labels.get(info["channel"]) or labels.get(info["probe"])
+            # A label given by the caller wins over the configured default, and an
+            # empty one clears it (the dashboard sends "" for a label removed there).
+            for key in (info["channel"], info["probe"]):
+                if key in labels:
+                    info["label"] = str(labels[key]).strip() or None
+                    break
             P = np.concatenate(pos[i]) if pos[i] else np.zeros(0, np.int64)
             L = np.concatenate(lev[i]) if lev[i] else np.zeros(0, np.uint8)
             info.update(_stats(P, L, rate, n, (first >> i) & 1, (last_byte >> i) & 1, cycles))

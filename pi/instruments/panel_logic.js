@@ -137,6 +137,7 @@ mount.innerHTML = `
   <div class="siggen-row">
     <button type="button" id="la-single" class="run" title="One capture">Single</button>
     <button type="button" id="la-run" title="Capture repeatedly">Run</button>
+    <button type="button" id="la-clear" title="Clear the screen: capture, waveforms, table, statistics, trend, cursors, levels (the analyzer itself is not touched)">Clear</button>
     <span class="la-sep"></span>
     <label>Rate</label><select id="la-rate"></select>
     <label>Length</label><select id="la-dur">${DURATIONS.map(d => '<option value="' + d + '">' + fmtDur(d) + '</option>').join('')}</select>
@@ -323,8 +324,8 @@ async function capture() {
     if (busy) return;
     if (!prefs.chans.length) { setErr('enable at least one channel'); return; }
     busy = true; renderAnn(); $('la-val').classList.add('busy');
-    const labels = {};
-    prefs.chans.forEach(i => { if (label(i)) labels[chName(i)] = label(i); });
+    const labels = {};       // every enabled channel: "" = label removed here (overrides the bench default)
+    prefs.chans.forEach(i => { labels[chName(i)] = label(i); });
     const body = {samplerate: prefs.rate, duration_ms: prefs.dur, channels: prefs.chans.map(chName), labels,
         max_edges: prefs.maxEdges, client: 'dashboard', cycles: MAX_CYCLES};
     try {
@@ -724,10 +725,10 @@ async function readLevels() {
     busy = true; renderAnn();
     try {
         const j = await api('/api/logic/state?client=dashboard&channels=' + prefs.chans.map(probe).join(','));
-        $('la-lv').innerHTML = Object.entries(j.levels).map(([p, v]) =>
+        $('la-lv').innerHTML = Object.entries(j.levels).map(([p, v]) => ({p, v, lb: label(+p.slice(2) - 1)})).map(({p, v, lb}) =>
             '<span class="' + (!v.stable ? 'tg' : v.level ? 'hi' : 'lo') + '" title="' + (v.stable ? 'stable for 20 ms' :
                 v.edges + ' edges in 20 ms' + (v.frequency_hz ? ' · ' + fmtFs(v.frequency_hz, 5) : '')) + '">' + p +
-            (v.label ? ' ' + v.label : '') + ' ' + (!v.stable ? '⇅' : v.level ? 'HIGH' : 'LOW') + '</span>').join('') +
+            (lb ? ' ' + esc(lb) : '') + ' ' + (!v.stable ? '⇅' : v.level ? 'HIGH' : 'LOW') + '</span>').join('') +
             '<span style="border:none;background:none;color:#556">' + new Date(j.at_epoch_ms).toLocaleTimeString() + '</span>';
         setErr('');
     } catch (e) { setErr(e.code === 409 ? 'analyzer busy (another client is capturing)' : 'levels: ' + e.message, 'warn'); }
@@ -767,6 +768,19 @@ $('la-tbl').onclick = e => {
 $('la-lim').onchange = e => { prefs.lim = e.target.checked; st.fail = 0; savePrefs(); renderAll(); };
 for (const k of ['flo', 'fhi', 'dlo', 'dhi']) $('la-' + k).onchange = e => { prefs[k] = e.target.value; st.fail = 0; savePrefs(); renderAll(); };
 $('la-reset').onclick = () => { resetStats(); renderStats(); };
+// Clear the screen. Remember which capture was on it so the follow mode (and a
+// page reload) does not bring the same one back; a newer capture shows as usual.
+$('la-clear').onclick = () => {
+    if (running) stop();
+    if (cap && cap.raw.captured_at_epoch_ms) prefs.clearedAt = cap.raw.captured_at_epoch_ms;
+    else if (status && status.service && status.service.last) prefs.clearedAt = status.service.last.at_epoch_ms;
+    savePrefs();
+    cap = null; curA = curB = null; hover = null;
+    resetStats(); fit();
+    $('la-lv').innerHTML = '';
+    setErr('');
+    renderAll();
+};
 $('la-fit').onclick = () => { fit(); draw(); };
 $('la-zin').onclick = () => zoomAt((view.a + view.b) / 2, 0.5);
 $('la-zout').onclick = () => zoomAt((view.a + view.b) / 2, 2);
@@ -882,7 +896,8 @@ async function refreshStatus() {
     renderAnn();
     // Follow mode: show captures made by others (tests, MCP) while we are idle.
     const L = status.service && status.service.last;
-    if (L && !running && !busy && visible && (!cap || L.at_epoch_ms !== cap.raw.captured_at_epoch_ms)) {
+    if (L && !running && !busy && visible && !(L.at_epoch_ms <= (prefs.clearedAt || 0)) &&
+        (!cap || L.at_epoch_ms !== cap.raw.captured_at_epoch_ms)) {
         try { ingest(await api('/api/logic/last'), false); setErr(''); } catch (e) { /* raced with a new capture */ }
     }
 }
@@ -894,7 +909,10 @@ fetch('/api/devices').then(r => r.json()).then(j => { if (!lastSlots && j.slots)
 
 // Show the last capture made by anyone (MCP, tests) when the page opens.
 loadStatus().then(async () => {
-    try { const j = await api('/api/logic/last'); ingest(j, false); } catch (e) { /* none yet */ }
+    try {
+        const j = await api('/api/logic/last');
+        if (!(j.captured_at_epoch_ms <= (prefs.clearedAt || 0))) ingest(j, false);
+    } catch (e) { /* none yet */ }
     renderAll();
 });
 })();
