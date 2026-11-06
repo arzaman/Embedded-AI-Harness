@@ -14,12 +14,10 @@ import collections
 import threading
 import time
 
-from ads1110 import PGA_BITS, ADS1110Error
 
 BUFFER = 240 * 60 * 15      # 15 min at the fastest rate
 IDLE_STOP_S = 15.0
 MAX_BATCH = 4000
-GAINS = sorted(PGA_BITS)    # 1, 2, 4, 8
 
 
 class MeterStream:
@@ -58,13 +56,14 @@ class MeterStream:
 
     def _step_gain(self, code: int) -> bool:
         m = self.meter
-        i = GAINS.index(m.pga)
+        gains = m.gains
+        i = gains.index(m.pga)
         full = m.max_code()
         if abs(code) >= 0.95 * full and i > 0:
-            m.configure(m.sps, GAINS[i - 1])
+            m.configure(m.sps, gains[i - 1])
             return True
-        if i + 1 < len(GAINS) and abs(code) * GAINS[i + 1] / m.pga < 0.8 * full:
-            m.configure(m.sps, GAINS[i + 1])
+        if i + 1 < len(gains) and abs(code) * gains[i + 1] / m.pga < 0.8 * full:
+            m.configure(m.sps, gains[i + 1])
             return True
         return False
 
@@ -88,8 +87,8 @@ class MeterStream:
                     self._seq += 1
                     self._buf.append((self._seq, t_ms, volts, int(ol)))
                 self._error = None
-                time.sleep(0.7 / m.sps)    # leave the bus to /read and /config
-            except (ADS1110Error, OSError) as e:
+                time.sleep(min(0.7 / m.sps, 0.02))    # leave the bus to /read and /config
+            except Exception as e:  # driver error or I2C OSError
                 self._error = str(e)
                 time.sleep(0.5)
 

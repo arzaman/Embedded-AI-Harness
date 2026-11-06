@@ -13,9 +13,9 @@ dpkg -s sigrok-cli sigrok-firmware-fx2lafw python3-numpy >/dev/null 2>&1 || \
     apt-get install -y sigrok-cli sigrok-firmware-fx2lafw python3-numpy
 
 mkdir -p "$DEST"
-cp "$SRC/ads1110.py" "$SRC/meter_stream.py" "$SRC/logic.py" "$SRC/dut.py" \
+cp "$SRC/ads1110.py" "$SRC/ads1115.py" "$SRC/gp8413.py" "$SRC/servos8.py" "$SRC/meter_stream.py" "$SRC/logic.py" "$SRC/dut.py" \
    "$SRC/dut_probe.py" "$SRC/instruments_server.py" "$SRC/panel_meter.js" \
-   "$SRC/panel_logic.js" "$SRC/panel_dut.js" "$DEST/"
+   "$SRC/panel_logic.js" "$SRC/panel_dut.js" "$SRC/panel_dac.js" "$SRC/panel_io.js" "$DEST/"
 cp "$SRC/hil-instruments.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable hil-instruments >/dev/null

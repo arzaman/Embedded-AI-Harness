@@ -2,7 +2,7 @@
 """MCP server for the HIL instruments service — zero dependencies.
 
 Companion to testbench_mcp.py (left untouched). Thin stdio proxy:
-  * meter_*, logic_* -> instruments service (INSTRUMENTS_URL, default :8081)
+  * meter_*, dac_*, io_*, logic_* -> instruments service (INSTRUMENTS_URL, default :8081)
   * dut_console   -> one console command on a DUT through the portal's serial
                      API (TESTBENCH_URL), returning the OK/ERR reply line.
 
@@ -43,18 +43,66 @@ SPECS = [
     dict(name="instruments_info", method="GET", path="/api/info",
          desc="HIL instruments service version and which instruments are present."),
     dict(name="meter_read", method="POST", path="/api/meter/read",
-         desc="Bench voltmeter (Unit ADC v1.1 / ADS1110 on the Pi): measure DC volts at its input, "
-              "averaged over `samples` fresh conversions (15 sps -> ~70 ms each). Single-ended, "
-              "referenced to bench GND, 0..~12 V at PGA 1. Returns calibrated `volts` plus raw codes.",
+         desc="Bench voltmeter: measure DC volts at its input, averaged over `samples` fresh "
+              "conversions. Default backend U087 (isolated, differential V+/V-, +/-32 V at pga 1, "
+              "+/-16 V at pga 2, max 36 V; ~31 ms per sample at 32 sps); the legacy ADS1110 "
+              "backend is single-ended vs bench GND, 0..~12 V. Returns calibrated `volts`, raw "
+              "codes and `ol` (over range). meter_status says which backend is active.",
          props={"samples": dict(**S_INT, default=8, minimum=1, maximum=256)}, timeout=60),
     dict(name="meter_config", method="POST", path="/api/meter/config",
-         desc="Voltmeter data rate / gain. sps 15 = 16 bit (default), 240 = 12 bit. "
-              "PGA >1 shrinks full scale (~12.5 V / PGA). autorange=true lets the live stream "
-              "(dashboard multimeter) pick the PGA; an explicit pga turns autorange off.",
-         props={"sps": dict(**S_INT, enum=[15, 30, 60, 240]), "pga": dict(**S_INT, enum=[1, 2, 4, 8]),
-                "autorange": {"type": "boolean"}}),
+         desc="Voltmeter data rate / gain. Valid values depend on the backend (meter_status "
+              "lists `rates` and `ranges`): U087 sps 8..860 (default 32), pga 1 (+/-32 V) or "
+              "2 (+/-16 V). autorange=true lets the live stream (dashboard multimeter) pick the "
+              "pga; an explicit pga turns autorange off.",
+         props={"sps": S_INT, "pga": S_INT, "autorange": {"type": "boolean"}}),
     dict(name="meter_status", method="GET", path="/api/meter/status",
-         desc="Voltmeter address, sps, pga, ranges, autorange and calibration (scale, offset)."),
+         desc="Voltmeter model, address, isolated, sps, pga, rates, ranges, autorange and "
+              "calibration (factory factor from the unit EEPROM, user gain/offset)."),
+    dict(name="dac_status", method="GET", path="/api/dac/status",
+         desc="Bench DAC (DAC2 / GP8413, 2 outputs DAC0/DAC1 vs AGND, 0..10 V, 2.44 mV steps): "
+              "commanded volts and codes, per-channel calibration, max_v ceiling. The DAC is "
+              "write-only: volts are what was commanded, measure with meter_read to verify."),
+    dict(name="dac_set", method="POST", path="/api/dac/set",
+         desc="Set a bench DAC output: channel 0|1 and volts (0..10, or 0..max_v if the bench "
+              "config limits it). Or volts=[v0, v1] for both at once. The service starts with "
+              "both outputs at 0 V; put them back to 0 V (dac_off) when done.",
+         props={"channel": dict(**S_INT, enum=[0, 1], default=0),
+                "volts": {"description": "number, or [v0, v1]"}},
+         required=["volts"]),
+    dict(name="dac_off", method="POST", path="/api/dac/off",
+         desc="Both bench DAC outputs to 0 V."),
+    dict(name="io_status", method="GET", path="/api/io/status",
+         desc="Bench digital I/O unit (8 channels IO0..IO7, 3.3 V logic): mode of each channel "
+              "(DI, DO, PWM, ADC), DO levels, PWM duty, and how many unit resets (configuration "
+              "lost and re-applied) the service has seen."),
+    dict(name="io_read", method="GET", path="/api/io/read",
+         desc="Level of every bench I/O channel now: DI read from the unit (an open input reads "
+              "1), DO/PWM as commanded, ADC in counts and volts "
+              "(0..3.3 V). ~15 ms per call; t_epoch_ms on the Pi clock. For timing (edges, "
+              "pulse width, PWM duty) wire the channel to the logic analyzer instead.",
+         timeout=15),
+    dict(name="io_mode", method="POST", path="/api/io/mode",
+         desc="Configure one bench I/O channel: mode DI, DO (with initial level, default 0), "
+              "PWM or ADC. A DO drives the pin: make sure the channel is wired as an output "
+              "(on a bench panel with direction switches, that switch must be OUT).",
+         props={"channel": dict(**S_STR, description="IO0..IO7 or 0..7"),
+                "mode": dict(**S_STR, enum=["DI", "DO", "PWM", "ADC"]),
+                "level": dict(**S_INT, enum=[0, 1], default=0)},
+         required=["channel", "mode"]),
+    dict(name="io_write", method="POST", path="/api/io/write",
+         desc="Set bench I/O channels that are in DO mode to 0 or 1: one channel "
+              "(channel + level) or several at once with levels={'IO0': 1, 'IO1': 0}, written in "
+              "one I2C transfer so they change together (<1 ms apart; separate calls are "
+              "10-30 ms apart). `atomic` false = a non-DO channel sat between them.",
+         props={"channel": dict(**S_STR, description="IO0..IO7 or 0..7"),
+                "level": dict(**S_INT, enum=[0, 1]),
+                "levels": {"type": "object", "description": "e.g. {'IO0': 1, 'IO1': 0}"}}),
+    dict(name="io_pwm", method="POST", path="/api/io/pwm",
+         desc="PWM on a bench I/O channel (sets mode PWM): duty 0..100 % in 1 % steps, fixed "
+              "~1 kHz (unit oscillator: measure the real frequency with the logic analyzer).",
+         props={"channel": dict(**S_STR, description="IO0..IO7 or 0..7"),
+                "duty_pct": dict(**S_INT, minimum=0, maximum=100)},
+         required=["channel", "duty_pct"]),
     dict(name="logic_status", method="GET", path="/api/logic/status",
          desc="Logic analyzer (Saleae Logic clone, sigrok fx2lafw) on the Pi: present, busy, "
               "channels (probe CH1..CH8 = D0..D7, labels), supported samplerates."),

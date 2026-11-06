@@ -31,16 +31,35 @@ portal dashboard (:8080) can host our panels.
   GET  /api/dut/status    ESP32 USB devices (sysfs) + cached chip/flash/firmware probes
   POST /api/dut/probe     {"slot": "SLOT1"} -> chip, flash, partitions, app descriptors
                           (ROM bootloader session: REBOOTS the DUT)
-  GET  /panel/meter.js    dashboard panel (loaded by the portal, see
+  GET  /api/dac/status    bench DAC range, outputs, calibration
+  POST /api/dac/set       {"channel": 0, "volts": 2.5}  or {"volts": [1.0, 2.0]}
+  POST /api/dac/off       both outputs 0 V
+  GET  /api/io/status     bench I/O unit: modes, DO levels, PWM duty, resets seen
+  GET  /api/io/read       level of every channel (DI read now, DO/PWM as commanded)
+  POST /api/io/mode       {"channel": "IO0", "mode": "DI"|"DO"|"PWM"|"ADC", "level": 0}
+  POST /api/io/write      {"channel": "IO0", "level": 1}      (channel in DO)
+                          {"levels": {"IO0": 1, "IO1": 0}}    several DO at once (one I2C write)
+  POST /api/io/pwm        {"channel": "IO0", "duty_pct": 50}  (~1 kHz, sets mode PWM)
+  GET  /panel/<name>.js   dashboard panels (loaded by the portal, see
                           pi/dashboard_panels.py)
 
-Voltmeter = M5Stack Unit ADC v1.1 (ADS1110) on the Pi I2C bus. Single-ended,
-not isolated: measures against the bench ground.
+Voltmeter backends (config "meter_backend"):
+  "u087"    M5Stack Unit Voltmeter (ADS1115 + EEPROM calibration), isolated,
+            differential V+/V-, +/-32 V (default)
+  "ads1110" M5Stack Unit ADC v1.1, single-ended, not isolated
+Bench DAC = M5Stack Unit DAC2 (GP8413), 2 x 0-10 V (optional lower ceiling dac_max_v).
+Bench I/O = M5Stack Unit 8Servos v1: 8 channels DI/DO/PWM/ADC, 3.3 V.
 Logic analyzer = Saleae Logic clone (FX2, sigrok fx2lafw), probes CH1..CH8 = D0..D7.
 
 Config (optional): /etc/rfc2217/instruments.json
-  {"port": 8081, "i2c_bus": 1, "meter_address": 72,
-   "meter_scale": 6.1, "meter_offset_v": 0.0, "logic_labels": {"D0": "LED"}}
+  {"port": 8081, "i2c_bus": 1, "logic_labels": {"D0": "LED"},
+   "meter_backend": "u087", "meter_address": 73, "meter_eeprom": 83,
+   "meter_user_gain": 1.0, "meter_user_offset_v": 0.0, "meter_sps": 32,
+   (ads1110: "meter_address": 72, "meter_scale": 6.1, "meter_offset_v": 0.0)
+   "dac_address": 89, "dac_max_v": null,
+   "dac_cal": {"0": {"gain": 1.0, "offset_v": 0.0}},
+   "io_address": 37, "io_modes": {"IO0": "DI"}}
+An instrument that is absent is reported as such and retried on demand.
 """
 import http.server
 import json
@@ -51,17 +70,27 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ads1110 import ADS1110, ADS1110Error, NOMINAL_SCALE  # noqa: E402
+from ads1115 import U087Meter, ADS1115Error  # noqa: E402
+from gp8413 import GP8413, GP8413Error  # noqa: E402
+from servos8 import Servos8IO, BenchIOError  # noqa: E402
 from meter_stream import MeterStream  # noqa: E402
 from logic import LogicAnalyzer, LogicError  # noqa: E402
 from dut import DutProber  # noqa: E402
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 PANELS = {"/panel/meter.js": "panel_meter.js", "/panel/logic.js": "panel_logic.js",
-          "/panel/dut.js": "panel_dut.js"}
+          "/panel/dut.js": "panel_dut.js", "/panel/dac.js": "panel_dac.js",
+          "/panel/io.js": "panel_io.js"}
 CONFIG_PATH = "/etc/rfc2217/instruments.json"
-DEFAULTS = {"port": 8081, "i2c_bus": 1, "meter_address": 0x48,
-            "meter_scale": NOMINAL_SCALE, "meter_offset_v": 0.0, "logic_labels": {}}
+DEFAULTS = {"port": 8081, "i2c_bus": 1, "logic_labels": {},
+            "meter_backend": "u087", "meter_eeprom": 0x53,
+            "meter_user_gain": 1.0, "meter_user_offset_v": 0.0, "meter_sps": 32,
+            "meter_scale": NOMINAL_SCALE, "meter_offset_v": 0.0,
+            "dac_address": 0x59, "dac_max_v": None, "dac_cal": {},
+            "io_address": 0x25, "io_modes": {}}
+METER_ADDR = {"u087": 0x49, "ads1110": 0x48}
+METER_ERRORS = (ADS1110Error, ADS1115Error, OSError)
 
 
 def load_config() -> dict:
@@ -84,16 +113,55 @@ DUT = DutProber()
 
 def init_meter() -> None:
     global METER, METER_ERROR, STREAM
+    backend = CFG["meter_backend"]
+    addr = CFG.get("meter_address", METER_ADDR.get(backend, 0))
     try:
-        if not ADS1110.probe(CFG["i2c_bus"], CFG["meter_address"]):
-            raise ADS1110Error(f"no ACK at 0x{CFG['meter_address']:02x} "
-                               f"on i2c-{CFG['i2c_bus']}")
-        METER = ADS1110(CFG["i2c_bus"], CFG["meter_address"],
-                        CFG["meter_scale"], CFG["meter_offset_v"])
+        if backend == "u087":
+            if not U087Meter.probe(CFG["i2c_bus"], addr):
+                raise ADS1115Error(f"U087 voltmeter: no ACK at 0x{addr:02x} "
+                                   f"on i2c-{CFG['i2c_bus']}")
+            METER = U087Meter(CFG["i2c_bus"], addr, CFG["meter_eeprom"],
+                              CFG["meter_user_gain"], CFG["meter_user_offset_v"],
+                              CFG["meter_sps"])
+        elif backend == "ads1110":
+            if not ADS1110.probe(CFG["i2c_bus"], addr):
+                raise ADS1110Error(f"ADS1110 voltmeter: no ACK at 0x{addr:02x} "
+                                   f"on i2c-{CFG['i2c_bus']}")
+            METER = ADS1110(CFG["i2c_bus"], addr, CFG["meter_scale"], CFG["meter_offset_v"])
+        else:
+            raise ADS1110Error(f"unknown meter_backend {backend!r}")
         STREAM = MeterStream(METER)
         METER_ERROR = None
-    except (ADS1110Error, OSError) as e:
+    except METER_ERRORS as e:
         METER, METER_ERROR = None, str(e)
+
+
+DAC = DAC_ERROR = None
+IO = IO_ERROR = None
+
+
+def init_dac() -> None:
+    global DAC, DAC_ERROR
+    try:
+        if not GP8413.probe(CFG["i2c_bus"], CFG["dac_address"]):
+            raise GP8413Error(f"DAC2: no ACK at 0x{CFG['dac_address']:02x} "
+                              f"on i2c-{CFG['i2c_bus']}")
+        dac = GP8413(CFG["i2c_bus"], CFG["dac_address"], CFG["dac_cal"], CFG["dac_max_v"])
+        dac.init()                                  # 10 V range, both outputs 0 V
+        DAC, DAC_ERROR = dac, None
+    except (GP8413Error, OSError) as e:
+        DAC, DAC_ERROR = None, str(e)
+
+
+def init_io() -> None:
+    global IO, IO_ERROR
+    try:
+        if not Servos8IO.probe(CFG["i2c_bus"], CFG["io_address"]):
+            raise BenchIOError(f"8Servos: no ACK at 0x{CFG['io_address']:02x} "
+                               f"on i2c-{CFG['i2c_bus']}")
+        IO, IO_ERROR = Servos8IO(CFG["i2c_bus"], CFG["io_address"], CFG["io_modes"]), None
+    except (BenchIOError, OSError) as e:
+        IO, IO_ERROR = None, str(e)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -154,7 +222,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/info":
             self._send({"ok": True, "service": "hil-instruments", "version": VERSION,
                         "instruments": {"meter": {"present": METER is not None,
+                                                  "backend": CFG["meter_backend"],
+                                                  "model": getattr(METER, "model", None),
                                                   "error": METER_ERROR},
+                                        "dac": {"present": DAC is not None, "error": DAC_ERROR},
+                                        "io": {"present": IO is not None, "error": IO_ERROR},
                                         "logic": {"present": LOGIC.usb_device() is not None}}})
         elif self.path == "/api/logic/status":
             self._send({"ok": True, **LOGIC.status()})
@@ -167,6 +239,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send({"ok": True, **LOGIC.last})
             else:
                 self._send({"ok": False, "error": "no capture yet"}, 404)
+        elif url.path in ("/api/dac/status", "/api/io/status", "/api/io/read"):
+            self._bench(url.path, {})
         elif self.path == "/api/meter/status":
             meter = self._meter()
             if meter:
@@ -178,7 +252,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path not in ("/api/meter/read", "/api/meter/config", "/api/logic/capture",
-                             "/api/logic/arm", "/api/dut/probe"):
+                             "/api/logic/arm", "/api/dut/probe", *BENCH_POST):
             self._send({"ok": False, "error": "not found"}, 404)
             return
         try:
@@ -191,6 +265,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/api/dut/probe":
             self._dut_probe(body)
+            return
+        if self.path in BENCH_POST:
+            self._bench(self.path, body)
             return
         meter = self._meter()
         if not meter:
@@ -209,9 +286,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     STREAM.reconfigured()
                 self._send({"ok": True, **meter.status(),
                             "autorange": STREAM.autorange})
-        except (ADS1110Error, ValueError) as e:
+        except (ADS1110Error, ADS1115Error, ValueError) as e:
             self._send({"ok": False, "error": str(e)}, 400)
         except OSError as e:
+            self._send({"ok": False, "error": f"i2c: {e}"}, 502)
+
+    def _bench(self, path: str, body: dict) -> None:
+        """DAC and I/O unit endpoints."""
+        global DAC, IO
+        kind = path.split("/")[2]
+        if kind == "dac" and DAC is None:
+            init_dac()
+        if kind == "io" and IO is None:
+            init_io()
+        dev, err = (DAC, DAC_ERROR) if kind == "dac" else (IO, IO_ERROR)
+        if dev is None:
+            self._send({"ok": False, "error": f"{kind} unavailable: {err}"}, 503)
+            return
+        try:
+            if path == "/api/dac/set":
+                v = body.get("volts")
+                if isinstance(v, list):
+                    codes = [dev.set_voltage(ch, float(x)) for ch, x in enumerate(v[:2])
+                             if x is not None]
+                else:
+                    codes = [dev.set_voltage(int(body.get("channel", 0)), float(v))]
+                self._send({"ok": True, **dev.status(), "written_codes": codes})
+            elif path == "/api/dac/off":
+                for ch in (0, 1):
+                    dev.set_voltage(ch, 0.0)
+                self._send({"ok": True, **dev.status()})
+            elif path == "/api/io/read":
+                self._send({"ok": True, **dev.read()})
+            elif path == "/api/io/mode":
+                self._send({"ok": True, **dev.set_mode(body.get("channel"), body.get("mode"),
+                                                        int(body.get("level", 0)))})
+            elif path == "/api/io/write":
+                if "levels" in body:
+                    self._send({"ok": True, **dev.write_many(body["levels"])})
+                else:
+                    self._send({"ok": True, **dev.write(body.get("channel"),
+                                                         int(body.get("level")))})
+            elif path == "/api/io/pwm":
+                self._send({"ok": True, **dev.pwm(body.get("channel"), body.get("duty_pct"))})
+            else:  # status
+                self._send({"ok": True, **dev.status()})
+        except (GP8413Error, BenchIOError, ValueError, TypeError) as e:
+            self._send({"ok": False, "error": str(e)}, 400)
+        except OSError as e:
+            # Unit unplugged or bus error: drop it, the next call probes again.
+            if kind == "dac":
+                DAC = None
+            else:
+                IO = None
             self._send({"ok": False, "error": f"i2c: {e}"}, 502)
 
     def _dut_probe(self, body: dict) -> None:
@@ -258,15 +385,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send({"ok": False, "error": str(e)}, 400)
 
 
+BENCH_POST = ("/api/dac/set", "/api/dac/off",
+              "/api/io/mode", "/api/io/write", "/api/io/pwm")
+
+
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64      # dashboard polling + scripts: default 5 resets connections
 
 
 def main() -> None:
     init_meter()
-    print(f"hil-instruments {VERSION} on :{CFG['port']} meter="
-          f"{'ok' if METER else METER_ERROR}", flush=True)
+    init_dac()
+    init_io()
+    meter = f"ok ({METER.model})" if METER else METER_ERROR
+    print(f"hil-instruments {VERSION} on :{CFG['port']} meter={meter} "
+          f"dac={'ok' if DAC else DAC_ERROR} io={'ok' if IO else IO_ERROR}", flush=True)
     Server(("0.0.0.0", CFG["port"]), Handler).serve_forever()
 
 

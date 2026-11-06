@@ -185,6 +185,11 @@ function applyCfg(c) {
         });
     }
     sel.value = cfg.autorange ? 'auto' : String(cfg.pga);
+    const rsel = $('mm-rate');
+    if (cfg.rates && rsel.dataset.rates !== String(cfg.rates)) {     // rates of this backend
+        rsel.innerHTML = cfg.rates.map(r => '<option value="' + r + '">' + r + ' SPS</option>').join('');
+        rsel.dataset.rates = String(cfg.rates);
+    }
     $('mm-rate').value = String(cfg.sps);
     const fs = cfg.range_v || cfg.full_scale_v;
     $('mm-a-range').textContent = fs ? fs.toFixed(2) + ' V' : '—';
@@ -193,10 +198,14 @@ function applyCfg(c) {
     $('mm-bar-lo').textContent = fs ? '-' + fs.toFixed(1) : '';
     $('mm-bar-hi').textContent = fs ? '+' + fs.toFixed(1) : '';
     const lsb = cfg.lsb_v;
-    $('mm-info').textContent = 'ADS1110 @' + (cfg.address || '0x48') +
-        (cfg.cal ? ' · cal ×' + cfg.cal.scale + ' ' + (cfg.cal.offset_v * 1000).toFixed(2) + ' mV' : '') +
+    const cal = cfg.cal || {};
+    $('mm-info').textContent = (cfg.model || 'ADS1110') + ' @' + (cfg.address || '?') +
+        (cal.factory_factor ? ' · factory cal ×' + cal.factory_factor : '') +
+        (cal.user_gain !== undefined ? ' · user ×' + cal.user_gain + ' ' + (cal.user_offset_v * 1000).toFixed(2) + ' mV'
+            : (cal.scale ? ' · cal ×' + cal.scale + ' ' + (cal.offset_v * 1000).toFixed(2) + ' mV' : '')) +
         (lsb ? ' · LSB ' + (lsb * 1000).toFixed(3) + ' mV' : '') +
-        ' · single-ended, not isolated (Pi GND) · timestamps = Pi clock';
+        (cfg.isolated ? ' · isolated, differential V+/V−' + (cfg.input_max_v ? ' (max ±' + cfg.input_max_v + ' V)' : '')
+            : ' · single-ended, not isolated (Pi GND)') + ' · timestamps = Pi clock';
 }
 async function loadStatus() {
     try { applyCfg(await api('/api/meter/status')); setErr(''); }

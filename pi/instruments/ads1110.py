@@ -29,6 +29,11 @@ class ADS1110Error(Exception):
 
 
 class ADS1110:
+    model = "Unit ADC v1.1 (ADS1110, not isolated)"
+    gains = sorted(PGA_BITS)
+    rates = sorted(DR_BITS)
+    isolated = False
+
     def __init__(self, bus: int = 1, address: int = 0x48,
                  scale: float = NOMINAL_SCALE, offset_v: float = 0.0) -> None:
         if smbus2 is None:
@@ -111,7 +116,8 @@ class ADS1110:
         }
 
     def status(self) -> dict:
-        return {"address": f"0x{self.address:02x}", "sps": self.sps, "pga": self.pga,
+        return {"model": self.model, "address": f"0x{self.address:02x}", "isolated": False,
+                "rates": self.rates, "sps": self.sps, "pga": self.pga,
                 "full_scale_v": round(self.full_scale_v(), 3),
                 "lsb_v": self.lsb_v() * self.scale,
                 "ranges": {str(g): round(self.full_scale_v(g), 3) for g in PGA_BITS},

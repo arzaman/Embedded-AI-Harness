@@ -1,5 +1,5 @@
 [Unit]
-Description=HIL instruments service (bench voltmeter / logic analyzer)
+Description=HIL instruments service (voltmeter, DAC, digital I/O, logic analyzer)
 After=network-online.target
 Wants=network-online.target
 
