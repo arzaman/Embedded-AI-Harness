@@ -24,12 +24,13 @@ finds its mount <div> through document.currentScript.dataset.mount and gets
 a 'dash-panel-visibility' event ({detail: {visible}}) on the mount when the
 card is shown or hidden.
 """
+import http.client
 import json
 import os
 import re
+import select
+import socket
 import threading
-import urllib.error
-import urllib.request
 
 CONFIG_FILE = os.environ.get("DASHBOARD_CONFIG", "/etc/rfc2217/dashboard.json")
 BUILTINS = {
@@ -87,24 +88,75 @@ def _proxy_ports() -> set[int]:
 
 
 def proxy(handler, body: bytes | None = None) -> None:
-    """Forward /panels/<port>/<rest> to a local panel service."""
+    """Forward /panels/<port>/<rest> to a local panel service.
+
+    Supports both regular JSON/JS responses and streaming Server-Sent Events
+    (Content-Type: text/event-stream) without buffering.
+    """
     m = re.match(r"/panels/(\d+)(/.*)", handler.path)
     if not m or int(m.group(1)) not in _proxy_ports():
         return handler._send_json({"ok": False, "error": "no such panel service"}, 404)
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{m.group(1)}{m.group(2)}", data=body,
-        method="POST" if body is not None else "GET",
-        headers={"Content-Type": handler.headers.get("Content-Type", "application/json")})
+    port, target = int(m.group(1)), m.group(2)
+    headers = {"Content-Type": handler.headers.get("Content-Type", "application/json")}
+    accept = handler.headers.get("Accept")
+    if accept:
+        headers["Accept"] = accept
+    # POSTs can be long measurements (a 30 s logic capture + analysis).
+    conn = http.client.HTTPConnection("127.0.0.1", port,
+                                      timeout=120 if body is not None else 10)
     try:
-        # POSTs can be long measurements (a 30 s logic capture + analysis).
-        with urllib.request.urlopen(req, timeout=120 if body is not None else 10) as r:
-            status, ctype, data = r.status, r.headers.get("Content-Type"), r.read()
-    except urllib.error.HTTPError as e:
-        status, ctype, data = e.code, e.headers.get("Content-Type"), e.read()
-    except OSError as e:
+        conn.request("POST" if body is not None else "GET", target,
+                     body=body, headers=headers)
+        r = conn.getresponse()
+    except (OSError, http.client.HTTPException) as e:
+        conn.close()
         return handler._send_json({"ok": False, "error": f"panel service: {e}"}, 502)
+
+    ctype = r.getheader("Content-Type") or "application/octet-stream"
+    if ctype.lower().startswith("text/event-stream"):
+        # HTTP/1.0 with Connection: close detaches conn.sock into r.fp.raw._sock
+        sock = conn.sock or getattr(getattr(r.fp, "raw", None), "_sock", None)
+        if sock is not None:
+            sock.settimeout(60.0)
+        handler.send_response(r.status)
+        handler.send_header("Content-Type", ctype)
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.close_connection = True
+        cli_sock = getattr(handler, "connection", None)
+        try:
+            while True:
+                chunk = r.read1(4096)
+                if not chunk:
+                    break
+                if cli_sock is not None:
+                    rd, _, _ = select.select([cli_sock], [], [], 0)
+                    if rd and not cli_sock.recv(1, socket.MSG_PEEK):
+                        break
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError,
+                OSError, http.client.HTTPException):
+            pass
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+            conn.close()
+        return
+
+    try:
+        data = r.read()
+    except (OSError, http.client.HTTPException) as e:
+        conn.close()
+        return handler._send_json({"ok": False, "error": f"panel service: {e}"}, 502)
+    status = r.status
+    conn.close()
     handler.send_response(status)
-    handler.send_header("Content-Type", ctype or "application/octet-stream")
+    handler.send_header("Content-Type", ctype)
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()

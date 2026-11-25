@@ -18,6 +18,11 @@
       "id": "dut",
       "title": "DUT details",
       "script": ":8081/panel/dut.js"
+    },
+    {
+      "id": "serial",
+      "title": "Serial Monitor",
+      "script": ":8081/panel/serial.js"
     }
   ]
 }
