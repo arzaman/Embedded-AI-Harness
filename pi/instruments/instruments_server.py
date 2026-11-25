@@ -31,6 +31,9 @@ portal dashboard (:8080) can host our panels.
   GET  /api/dut/status    ESP32 USB devices (sysfs) + cached chip/flash/firmware probes
   POST /api/dut/probe     {"slot": "SLOT1"} -> chip, flash, partitions, app descriptors
                           (ROM bootloader session: REBOOTS the DUT)
+  GET  /api/serial/stream?slots=SLOT1,SLOT2&backlog=200
+                          multiplexed SSE stream of raw bytes + slot state from the
+                          portal's read-only monitor_port fan-out (never touches /dev/tty*)
   GET  /api/dac/status    bench DAC range, outputs, calibration
   POST /api/dac/set       {"channel": 0, "volts": 2.5}  or {"volts": [1.0, 2.0]}
   POST /api/dac/off       both outputs 0 V
@@ -64,6 +67,8 @@ An instrument that is absent is reported as such and retried on demand.
 import http.server
 import json
 import os
+import select
+import socket
 import socketserver
 import sys
 from urllib.parse import parse_qs, urlparse
@@ -76,12 +81,13 @@ from servos8 import Servos8IO, BenchIOError  # noqa: E402
 from meter_stream import MeterStream  # noqa: E402
 from logic import LogicAnalyzer, LogicError  # noqa: E402
 from dut import DutProber  # noqa: E402
+from serial_hub import SerialHub  # noqa: E402
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 PANELS = {"/panel/meter.js": "panel_meter.js", "/panel/logic.js": "panel_logic.js",
           "/panel/dut.js": "panel_dut.js", "/panel/dac.js": "panel_dac.js",
-          "/panel/io.js": "panel_io.js"}
+          "/panel/io.js": "panel_io.js", "/panel/serial.js": "panel_serial.js"}
 CONFIG_PATH = "/etc/rfc2217/instruments.json"
 DEFAULTS = {"port": 8081, "i2c_bus": 1, "logic_labels": {},
             "meter_backend": "u087", "meter_eeprom": 0x53,
@@ -109,6 +115,7 @@ METER_ERROR = None
 STREAM = None
 LOGIC = LogicAnalyzer(CFG["logic_labels"])
 DUT = DutProber()
+SERIAL = SerialHub(dut_prober=DUT)
 
 
 def init_meter() -> None:
@@ -232,6 +239,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send({"ok": True, **LOGIC.status()})
         elif self.path == "/api/dut/status":
             self._send({"ok": True, **DUT.status()})
+        elif url.path == "/api/serial/stream":
+            self._serial_stream(parse_qs(url.query))
         elif url.path in ("/api/logic/result", "/api/logic/state"):
             self._logic_get(url.path, {k: v[0] for k, v in parse_qs(url.query).items()})
         elif self.path == "/api/logic/last":
@@ -353,6 +362,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send({"ok": False, "error": str(e)}, 400)
         except OSError as e:
             self._send({"ok": False, "error": f"portal: {e}"}, 502)
+
+    def _serial_stream(self, qs: dict) -> None:
+        raw = qs.get("slots", qs.get("slot", [""]))[0]
+        slots = [s.strip() for s in raw.split(",") if s.strip()]
+        if not slots:
+            self._send({"ok": False, "error": "slots query param required, e.g. ?slots=SLOT1"}, 400)
+            return
+        try:
+            backlog = max(0, min(500, int(qs.get("backlog", ["200"])[0])))
+        except ValueError:
+            backlog = 200
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def _client_gone() -> bool:
+            try:
+                rd, _, _ = select.select([self.connection], [], [], 0)
+                return bool(rd) and not self.connection.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return True
+
+        gen = SERIAL.stream_sse(slots, backlog=backlog, is_disconnected=_client_gone)
+        try:
+            for chunk in gen:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            gen.close()
 
     def _logic_capture(self, body: dict, arm: bool = False) -> None:
         args = {k: body[k] for k in ("samplerate", "duration_ms", "channels", "labels",
